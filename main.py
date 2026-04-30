@@ -1,3 +1,6 @@
+import os
+os.environ["TF_USE_LEGACY_KERAS"] = "1"
+
 from fastapi import FastAPI, File, UploadFile, Query, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse # Added for proper image serving
