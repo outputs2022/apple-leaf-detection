@@ -1,31 +1,24 @@
 import os
+# Force legacy Keras to handle .h5 files correctly in newer TF versions
 os.environ["TF_USE_LEGACY_KERAS"] = "1"
 
 from fastapi import FastAPI, File, UploadFile, Query, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse # Added for proper image serving
+from fastapi.responses import FileResponse
 import numpy as np
 import cv2
 import io
-import os
 import uuid
 import time
 import threading
 from PIL import Image
+import tensorflow as tf
 from tensorflow.keras.models import load_model
+import uvicorn
 
 app = FastAPI()
 
-# --- 1. BYPASS MIDDLEWARE & CORS ---
-# This forces every response to include the headers that stop tunnels from blocking requests
-@app.middleware("http")
-async def add_tunnel_bypass_headers(request: Request, call_next):
-    response = await call_next(request)
-    response.headers["bypass-tunnel-reminder"] = "true" # For localtunnel
-    response.headers["ngrok-skip-browser-warning"] = "true" # For ngrok
-    response.headers["Access-Control-Allow-Origin"] = "*"
-    return response
-
+# --- 1. CORS CONFIGURATION ---
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -36,8 +29,7 @@ app.add_middleware(
 OUTPUT_DIR = "annotated_outputs"
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
-# --- 2. CUSTOM IMAGE ROUTE (Replaces StaticFiles) ---
-# We use this instead of app.mount to ensure the image/jpeg header is forced
+# --- 2. IMAGE SERVING ---
 @app.get("/outputs/{filename}")
 async def get_image(filename: str):
     file_path = os.path.join(OUTPUT_DIR, filename)
@@ -54,15 +46,18 @@ IMG_SIZE  = 256
 HSV_LOWER = np.array([20, 40, 40])
 HSV_UPPER = np.array([90, 255, 255])
 
-print("Loading model...")
-model = load_model("modelAppleFinal.h5")
-print("Model ready.")
+# Lazy load model to prevent Render port-binding timeouts
+model = None
 
-# Ensure this URL matches your localtunnel output exactly
-BASE_URL = "https://candle-daydream-myself.ngrok-free.dev"
+def get_model():
+    global model
+    if model is None:
+        print("Loading model...")
+        model = load_model("modelAppleFinal.h5")
+        print("Model ready.")
+    return model
 
-# ... (segment_and_detect, preprocess, and draw_annotations functions remain the same) ...
-
+# --- 4. PROCESSING FUNCTIONS ---
 def segment_and_detect(img_rgb):
     hsv = cv2.cvtColor(img_rgb, cv2.COLOR_RGB2HSV)
     mask = cv2.inRange(hsv, HSV_LOWER, HSV_UPPER)
@@ -104,22 +99,29 @@ def cleanup_old_images():
         for fname in os.listdir(OUTPUT_DIR):
             fpath = os.path.join(OUTPUT_DIR, fname)
             if os.path.isfile(fpath) and now - os.path.getmtime(fpath) > 300:
-                os.remove(fpath)
+                try:
+                    os.remove(fpath)
+                except:
+                    pass
 
 threading.Thread(target=cleanup_old_images, daemon=True).start()
 
+# --- 5. ENDPOINTS ---
 @app.get("/")
 def health():
-    return {"status": "ok", "model": "Apple Leaf CNN"}
+    return {"status": "ok", "model_loaded": model is not None}
 
 @app.post("/predict")
-async def predict(leafImage: UploadFile = File(...)):
+async def predict(request: Request, leafImage: UploadFile = File(...)):
+    # Load model on first request if not already loaded
+    curr_model = get_model()
+    
     contents = await leafImage.read()
     pil_img = Image.open(io.BytesIO(contents)).convert("RGB")
     img_rgb = np.array(pil_img)
 
     regions, boxes = segment_and_detect(img_rgb)
-    all_preds = [model.predict(preprocess(r), verbose=0)[0] for r in regions]
+    all_preds = [curr_model.predict(preprocess(r), verbose=0)[0] for r in regions]
     avg_pred = np.mean(all_preds, axis=0)
     
     region_predictions = [(DISPLAY_LABELS[int(np.argmax(p))], round(float(np.max(p)), 2)) for p in all_preds]
@@ -129,8 +131,9 @@ async def predict(leafImage: UploadFile = File(...)):
     save_path = os.path.join(OUTPUT_DIR, filename)
     cv2.imwrite(save_path, cv2.cvtColor(annotated, cv2.COLOR_RGB2BGR))
 
-    # ADDED TIMESTAMP to prevent FlutterFlow from caching broken/old images
-    image_url = f"{BASE_URL.rstrip('/')}/outputs/{filename}?t={int(time.time())}"
+    # DYNAMICALLY GET THE URL (No more hardcoded ngrok!)
+    base_url = str(request.base_url).rstrip("/")
+    image_url = f"{base_url}/outputs/{filename}?t={int(time.time())}"
 
     return {
         "predicted_class": DISPLAY_LABELS[int(np.argmax(avg_pred))],
@@ -148,3 +151,7 @@ async def delete_image(filename: str = Query(...)):
         os.remove(file_path)
         return {"status": "deleted"}
     return {"status": "not_found"}
+
+if __name__ == "__main__":
+    port = int(os.environ.get("PORT", 8000))
+    uvicorn.run(app, host="0.0.0.0", port=port)
