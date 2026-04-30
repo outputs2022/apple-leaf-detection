@@ -1,7 +1,9 @@
 import os
-# Force legacy Keras to handle .h5 files correctly in newer TF versions
+# Force legacy Keras to handle .h5 files correctly in TF 2.15
 os.environ["TF_USE_LEGACY_KERAS"] = "1"
 
+import tensorflow as tf
+from tensorflow import keras
 from fastapi import FastAPI, File, UploadFile, Query, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
@@ -12,8 +14,6 @@ import uuid
 import time
 import threading
 from PIL import Image
-import tensorflow as tf
-from tensorflow.keras.models import load_model
 import uvicorn
 
 app = FastAPI()
@@ -46,18 +46,19 @@ IMG_SIZE  = 256
 HSV_LOWER = np.array([20, 40, 40])
 HSV_UPPER = np.array([90, 255, 255])
 
-# Lazy load model to prevent Render port-binding timeouts
+# Lazy loading to prevent Render port-binding timeouts
 model = None
 
 def get_model():
     global model
     if model is None:
-        print("Loading model...")
-        model = load_model("modelAppleFinal.h5")
+        print("Loading model via tf.keras...")
+        # Use the full path to the loader to avoid ModuleNotFound errors
+        model = tf.keras.models.load_model("modelAppleFinal.h5")
         print("Model ready.")
     return model
 
-# --- 4. PROCESSING FUNCTIONS ---
+# --- 4. IMAGE PROCESSING LOGIC ---
 def segment_and_detect(img_rgb):
     hsv = cv2.cvtColor(img_rgb, cv2.COLOR_RGB2HSV)
     mask = cv2.inRange(hsv, HSV_LOWER, HSV_UPPER)
@@ -99,10 +100,8 @@ def cleanup_old_images():
         for fname in os.listdir(OUTPUT_DIR):
             fpath = os.path.join(OUTPUT_DIR, fname)
             if os.path.isfile(fpath) and now - os.path.getmtime(fpath) > 300:
-                try:
-                    os.remove(fpath)
-                except:
-                    pass
+                try: os.remove(fpath)
+                except: pass
 
 threading.Thread(target=cleanup_old_images, daemon=True).start()
 
@@ -113,7 +112,6 @@ def health():
 
 @app.post("/predict")
 async def predict(request: Request, leafImage: UploadFile = File(...)):
-    # Load model on first request if not already loaded
     curr_model = get_model()
     
     contents = await leafImage.read()
@@ -131,7 +129,7 @@ async def predict(request: Request, leafImage: UploadFile = File(...)):
     save_path = os.path.join(OUTPUT_DIR, filename)
     cv2.imwrite(save_path, cv2.cvtColor(annotated, cv2.COLOR_RGB2BGR))
 
-    # DYNAMICALLY GET THE URL (No more hardcoded ngrok!)
+    # Dynamic URL Detection for Render
     base_url = str(request.base_url).rstrip("/")
     image_url = f"{base_url}/outputs/{filename}?t={int(time.time())}"
 
